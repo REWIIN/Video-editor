@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Блюр фона для видео</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/ort.min.js"></script>
+<style>
+:root{--bg:#eef0f6;--panel:#fff;--ink:#1a1d29;--mute:#6b7186;--acc:#4766e5;--line:#d9dce8;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--bg:#12141c;--panel:#1c202c;--ink:#e8eaf2;--mute:#8b92aa;--acc:#8aa4ff;--line:#2b3040}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.4 system-ui,sans-serif;padding:env(safe-area-inset-top,0) 12px 24px}
+.wrap{max-width:560px;margin:0 auto}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;margin-top:10px}
+h1{font-size:18px;margin:14px 0 0}
+label{display:block;color:var(--mute);font-size:13px;margin-top:8px}
+input,select{width:100%;padding:9px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font:inherit}
+input[type=range]{padding:0;accent-color:var(--acc)}
+button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:10px 14px;font:inherit;font-weight:600;margin-top:10px;width:100%}
+@media (prefers-color-scheme:dark){button{color:#12141c}}
+button:disabled{opacity:.5}
+canvas{display:block;margin:0 auto;max-width:100%;max-height:55vh;background:#000;border-radius:10px}
+#st{color:var(--mute);margin-top:8px;min-height:20px}
+.row{display:flex;gap:8px}.row>*{flex:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Блюр фона для видео</h1>
+  <div class="card">
+    <input type="file" id="file" accept="video/*">
+    <div class="row">
+      <div><label>Качество (длинная сторона)</label>
+      <select id="res"><option value="480">480</option><option value="640" selected>640</option><option value="854">854</option></select></div>
+      <div><label>Секунд обработать</label><input type="number" id="secs" value="5" min="1" max="30"></div>
+      <div><label>Кадров/с</label><input type="number" id="fps" value="24" min="10" max="30"></div>
+    </div>
+    <button id="go">Вырезать человека</button>
+    <div id="st"></div>
+  </div>
+  <div class="card">
+    <canvas id="out" width="360" height="640"></canvas>
+    <label>Кадр</label><input type="range" id="seek" min="0" max="0" value="0">
+    <label>Сила блюра: <span id="bv">20</span></label><input type="range" id="blur" min="0" max="60" value="20">
+    <div class="row"><button id="play" disabled>Пуск</button><button id="exp" disabled>Скачать видео</button></div>
+  </div>
+</div>
+<script>
+const $=id=>document.getElementById(id), out=$('out'), oc=out.getContext('2d');
+const say=s=>$('st').textContent=s;
+let sess=null, frames=[], W=360, H=640, FPS=24, playing=false;
+
+async function loadModel(){
+  if(sess) return;
+  say('Загружаю модель…');
+  const r=await fetch('rvm_mobilenetv3_fp32.onnx');
+  if(!r.ok) throw new Error('Файл rvm_mobilenetv3_fp32.onnx не найден рядом с index.html');
+  const buf=await r.arrayBuffer();
+  ort.env.wasm.numThreads=1;
+  sess=await ort.InferenceSession.create(buf,{executionProviders:['wasm']});
+}
+const blob=(c,type,q)=>new Promise(r=>c.toBlob(r,type,q));
+
+async function run(){
+  const f=$('file').files[0]; if(!f) return say('Сначала выберите видео');
+  $('go').disabled=true; $('play').disabled=true; $('exp').disabled=true; playing=false;
+  try{
+    await loadModel();
+    const v=document.createElement('video'); v.src=URL.createObjectURL(f); v.muted=true; v.playsInline=true;
+    await new Promise((ok,no)=>{v.onloadedmetadata=ok;v.onerror=()=>no(new Error('Не удалось открыть видео'))});
+    const s=Math.min(1,+$('res').value/Math.max(v.videoWidth,v.videoHeight));
+    W=Math.max(16,Math.round(v.videoWidth*s/16)*16); H=Math.max(16,Math.round(v.videoHeight*s/16)*16);
+    FPS=+$('fps').value;
+    const n=Math.floor(Math.min(v.duration,+$('secs').value)*FPS);
+    const c=document.createElement('canvas'); c.width=W; c.height=H;
+    const x=c.getContext('2d',{willReadFrequently:true});
+    const c2=document.createElement('canvas'); c2.width=W; c2.height=H;
+    const x2=c2.getContext('2d');
+    const ratio=Math.min(1,384/Math.max(W,H));
+    const z=()=>new ort.Tensor('float32',new Float32Array(1),[1,1,1,1]);
+    let st=[z(),z(),z(),z()];
+    const dr=new ort.Tensor('float32',new Float32Array([ratio]),[1]);
+    const N=W*H; frames=[]; const t0=performance.now();
+    for(let i=0;i<n;i++){
+      const sk=new Promise(r=>v.addEventListener('seeked',r,{once:true}));
+      v.currentTime=(i+0.5)/FPS; await sk;
+      x.drawImage(v,0,0,W,H);
+      const d=x.getImageData(0,0,W,H).data, a=new Float32Array(3*N);
+      for(let p=0;p<N;p++){a[p]=d[p*4]/255;a[N+p]=d[p*4+1]/255;a[2*N+p]=d[p*4+2]/255}
+      const o=await sess.run({src:new ort.Tensor('float32',a,[1,3,H,W]),r1i:st[0],r2i:st[1],r3i:st[2],r4i:st[3],downsample_ratio:dr});
+      st=[o.r1o,o.r2o,o.r3o,o.r4o];
+      const fg=o.fgr.data, ph=o.pha.data, im=x2.createImageData(W,H), q=im.data;
+      for(let p=0;p<N;p++){q[p*4]=fg[p]*255;q[p*4+1]=fg[N+p]*255;q[p*4+2]=fg[2*N+p]*255;q[p*4+3]=ph[p]*255}
+      x2.putImageData(im,0,0);
+      frames.push({bg:await blob(c,'image/jpeg',.92),fg:await blob(c2,'image/png')});
+      const el=(performance.now()-t0)/1000, eta=el/(i+1)*(n-i-1);
+      say(`Кадр ${i+1} из ${n}, осталось ~${Math.round(eta)} с`);
+    }
+    out.width=W; out.height=H;
+    $('seek').max=frames.length-1; $('seek').value=0;
+    await draw(0);
+    say('Готово. Двигайте ползунок кадров и силу блюра.');
+    $('play').disabled=false; $('exp').disabled=false;
+  }catch(e){say('Ошибка: '+e.message); console.error(e)}
+  $('go').disabled=false;
+}
+
+async function draw(i){
+  const [b,f]=await Promise.all([createImageBitmap(frames[i].bg),createImageBitmap(frames[i].fg)]);
+  const bl=+$('blur').value;
+  oc.filter='none'; oc.clearRect(0,0,W,H);
+  if(bl>0){
+    if('filter' in oc){oc.filter=`blur(${bl}px)`; oc.drawImage(b,-bl,-bl,W+2*bl,H+2*bl); oc.filter='none'}
+    else{const k=Math.max(2,bl/2),t=document.createElement('canvas');t.width=W/k;t.height=H/k;t.getContext('2d').drawImage(b,0,0,t.width,t.height);oc.drawImage(t,0,0,W,H)}
+  }else oc.drawImage(b,0,0,W,H);
+  oc.drawImage(f,0,0,W,H);
+  b.close(); f.close();
+}
+
+$('go').onclick=run;
+$('seek').oninput=()=>frames.length&&draw(+$('seek').value);
+$('blur').oninput=()=>{$('bv').textContent=$('blur').value; frames.length&&draw(+$('seek').value)};
+
+$('play').onclick=async()=>{
+  if(playing){playing=false;$('play').textContent='Пуск';return}
+  playing=true;$('play').textContent='Пауза';
+  let i=+$('seek').value; if(i>=frames.length-1) i=0;
+  for(;i<frames.length&&playing;i++){
+    const t=performance.now(); $('seek').value=i; await draw(i);
+    await new Promise(r=>setTimeout(r,Math.max(0,1000/FPS-(performance.now()-t))));
+  }
+  playing=false;$('play').textContent='Пуск';
+};
+
+$('exp').onclick=async()=>{
+  playing=false; $('exp').disabled=true; $('play').disabled=true;
+  const types=['video/mp4;codecs=avc1','video/webm;codecs=vp9','video/webm'];
+  const mime=types.find(t=>MediaRecorder.isTypeSupported(t))||'';
+  const rec=new MediaRecorder(out.captureStream(FPS),{mimeType:mime,videoBitsPerSecond:8e6});
+  const parts=[]; rec.ondataavailable=e=>e.data.size&&parts.push(e.data);
+  const done=new Promise(r=>rec.onstop=r);
+  rec.start();
+  for(let i=0;i<frames.length;i++){
+    const t=performance.now(); say(`Запись ${i+1} из ${frames.length}`); await draw(i);
+    await new Promise(r=>setTimeout(r,Math.max(0,1000/FPS-(performance.now()-t))));
+  }
+  rec.stop(); await done;
+  const ext=mime.includes('mp4')?'mp4':'webm';
+  const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob(parts,{type:mime||'video/webm'}));
+  a.download='blur.'+ext; a.click();
+  say('Видео сохранено (без звука).'); $('exp').disabled=false; $('play').disabled=false;
+};
+</script>
+</body>
+</html>
