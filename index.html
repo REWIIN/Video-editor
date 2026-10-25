@@ -31,7 +31,7 @@ canvas{display:block;margin:0 auto;max-width:100%;max-height:55vh;background:#00
     <input type="file" id="file" accept="video/*">
     <div class="row">
       <div><label>Качество (длинная сторона)</label>
-      <select id="res"><option value="480">480</option><option value="640" selected>640</option><option value="854">854</option></select></div>
+      <select id="res"><option value="480">480</option><option value="640" selected>640</option><option value="854">854</option><option value="1280">1280 (720p)</option><option value="1920">1920 (1080p)</option></select></div>
       <div><label>Секунд обработать</label><input type="number" id="secs" value="5" min="1" max="30"></div>
       <div><label>Кадров/с</label><input type="number" id="fps" value="24" min="10" max="30"></div>
     </div>
@@ -136,7 +136,7 @@ $('exp').onclick=async()=>{
   playing=false; $('exp').disabled=true; $('play').disabled=true;
   const types=['video/mp4;codecs=avc1','video/webm;codecs=vp9','video/webm'];
   const mime=types.find(t=>MediaRecorder.isTypeSupported(t))||'';
-  const rec=new MediaRecorder(out.captureStream(FPS),{mimeType:mime,videoBitsPerSecond:8e6});
+  const rec=new MediaRecorder(out.captureStream(FPS),{mimeType:mime,videoBitsPerSecond:Math.min(30e6,Math.max(8e6,W*H*FPS*0.12))});
   const parts=[]; rec.ondataavailable=e=>e.data.size&&parts.push(e.data);
   const done=new Promise(r=>rec.onstop=r);
   rec.start();
